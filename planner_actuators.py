@@ -184,6 +184,7 @@ def parse_prompt(text, positions):
       {"skill": "sweep", "side": "left" / "right"}     (empty sweep stroke)
       {"skill": "reset"}
       {"skill: grab", "object":name, "arm": None / "left" / "right", "follow": 0.0, "attempt": 0}
+      {"skil: drop", "object:name", "arm":None / "left" / "right", "follow": 0.0, "attempt: 0"}
     "tidy everything" and "sweep <side>" are expanded using the current object positions.
     """
     skills = []
@@ -222,6 +223,10 @@ def parse_prompt(text, positions):
             verb = "push"
         elif has_word(words, ["grab","pick","take"]):
             verb = "grab"
+        elif has_word(words, ["drop", "release", "let", "go"]):
+            verb = "drop"
+        elif has_word(words, ["return", "back", "reposition"]):
+            verb = "return"
         elif len(objs) > 0 and last_verb in ["push", "sweep", "tidy"]:
             verb = "push"       # e.g. "push red block and blue ball"
         if verb is None:
@@ -281,7 +286,7 @@ def parse_prompt(text, positions):
                     notes.append(n + " is already in the bin.")
                 else:
                     skills.append(make_push(n, None, 0.0))
-        else: # Picks up object
+        elif verb == "grab": # Picks up object
             side = None
             if "left" in words:
                 side = "left"
@@ -298,10 +303,22 @@ def parse_prompt(text, positions):
                 skills.append({"skill": "grab", "side": side})
             for n in sort_by_bin_distance(mine, positions):
                 skills.append(make_grab(n, side, 0.03))
-
+        elif verb == "drop":  #drops the object
+         side = None
+         if "left" in words:
+             side = "left"
+         elif "right" in words:
+             side = "right"
+         skills.append({"skill": "drop", "arm": side})
+        elif verb == "return":  #drops the object
+         side = None
+         if "left" in words:
+             side = "left"
+         elif "right" in words:
+             side = "right"
+         skills.append({"skill": "return", "arm": side})
 
     return skills, notes
-
 
 # Damped least-squares IK
 def skew(v):
@@ -510,10 +527,10 @@ def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
                       arm["side"] + ": lift"),
         make_keyframe(make_ctrl(amap, start_ctrl, arm, q_drop_hover, grip_closed), carry_time,
                       arm["side"] + ": carry to bin"),
-        make_keyframe(make_ctrl(amap, start_ctrl, arm, q_drop, grip_open), 0.5,
-                      arm["side"] + ": release"),
-        make_keyframe(clamp_ctrl(amap, home_ctrl), duration_for(q_drop, arm["home_q"], 0.9, 1.0),
-                      arm["side"] + ": retract"),
+        # make_keyframe(make_ctrl(amap, start_ctrl, arm, q_drop, grip_open), 0.5,
+        #               arm["side"] + ": release"),
+        # make_keyframe(clamp_ctrl(amap, home_ctrl), duration_for(q_drop, arm["home_q"], 0.9, 1.0),
+        #               arm["side"] + ": retract"),
     ]
 
     return {
@@ -525,7 +542,57 @@ def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
         "description": "",
     }
 
+def plan_drop_for_arm(amap, arm,start_ctrl):
 
+    grip_open = amap["hi"][arm["grip_act"]]
+    grip_closed = amap["lo"][arm["grip_act"]]
+    hold_q = start_ctrl[arm["act_ids"]].copy()
+
+
+    keyframes = [
+        make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 0.5, arm["side"] + ": open gripper"),
+        make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 0.4, arm["side"] + ": hold open"),
+        #make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_closed), 0.5, arm["side"] + ": close gripper"),
+        #make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_closed), 0.4, arm["side"] + ": hold close"),
+    ]
+
+    return {
+        "keyframes": keyframes,
+        "arm": arm["side"],
+        "max_err": 0.0,
+        "approximate": False,
+        "reset_objects": False,
+        "description": "drop/release with " + arm["side"] + " arm",
+    }
+
+def plan_return_for_arm(amap, start_ctrl, side=None):
+    """Return one arm (or both arms if side is None) back to home."""
+    home_ctrl = start_ctrl.copy()
+    sides_to_move = [side] if side in SIDES else SIDES
+    max_delta = 0.0
+
+    for s in sides_to_move:
+        arm = amap[s]
+        q_now = start_ctrl[arm["act_ids"]]
+        delta = float(np.max(np.abs(arm["home_q"] - q_now)))
+        if delta > max_delta:
+            max_delta = delta
+        home_ctrl[arm["act_ids"]] = arm["home_q"]
+        home_ctrl[arm["grip_act"]] = amap["home"][arm["grip_act"]]
+
+    target_ctrl = clamp_ctrl(amap, home_ctrl)
+    dur = max(0.8, max_delta / 0.9)
+    label_side = side if side in SIDES else "both arms"
+    keyframes = [make_keyframe(target_ctrl, dur, "return: " + label_side)]
+
+    return {
+        "keyframes": keyframes,
+        "arm": side,
+        "max_err": 0.0,
+        "approximate": False,
+        "reset_objects": False,
+        "description": "return " + label_side + " to home",
+    }
 
 def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
     """Turn one skill dict into a plan using the CURRENT object positions.
@@ -566,6 +633,19 @@ def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
                 attempt = skill["attempt"]
                 forced_arm = skill["arm"]
                 n_in_bin = sum(1 for other in positions if other != name and in_bin(positions[other]))
+
+    if kind == "drop":
+        side = skill.get("arm") or skill.get("side")
+        if side not in SIDES:
+            side = "left"
+        plan = plan_drop_for_arm(amap, amap[side], start_ctrl)
+        return plan, messages
+    elif kind == "return":
+        side = skill.get("arm") or skill.get("side")
+        if side not in SIDES:
+            side = None
+        plan = plan_return_for_arm(amap, start_ctrl, side=side)
+        return plan, messages
     else:
         if "object" not in skill:
             return None, ["No target object specified for " + kind + "."]
@@ -595,9 +675,15 @@ def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
     for side in candidates:
         if kind == "grab":
             plan = plan_grab_for_arm(model, scratch, amap ,amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
-        else:
+        elif kind == "push":
             plan = plan_push_for_arm(model, scratch, amap, amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
-        if plan is None:
+        elif kind == "drop":
+            plan = plan_drop_for_arm(model, scratch, amap ,amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
+            return plan, messages
+        elif kind == "return":
+            plan = plan_return_for_arm(amap,start_ctrl,amap[side])
+            return plan, messages
+        elif plan is None:
             continue
         score = plan["max_err"]
         if side != preferred:
