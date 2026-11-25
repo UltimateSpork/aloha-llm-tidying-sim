@@ -19,7 +19,7 @@ def build_skill_schema(object_names): #JSON schema constraining qwen2.5:3b outpu
                     "additionalProperties": False,
                     "required": ["skill", "object", "arm", "side", "follow"],
                     "properties": {
-                        "skill": {"type": "string", "enum": ["push", "sweep", "reset"]},
+                        "skill": {"type": "string", "enum": ["push", "sweep", "reset", "grab"]},
                         # Restrict object names dynamically to active scene entities (or null)
                         "object": {"type": ["string", "null"], "enum": list(object_names) + [None]},
                         "arm": {"type": ["string", "null"], "enum": ["left", "right", None]},
@@ -94,6 +94,27 @@ def normalize_skills(raw_skills, positions): #Validate and convert raw LLM skill
                 "follow": follow,
                 "attempt": 0,
             })
+        elif kind == "grab":
+            obj = item.get("object")
+            # # Guard against unknown objects or invalid scene states before queuing motion
+            if obj not in positions:
+                notes.append(f"Unknown object '{obj}' in LLM output.")
+                continue
+            if not pa.on_table(positions[obj]):
+                notes.append(f"{obj} is not on the table.")
+                continue
+            arm = item.get("arm")
+            if arm not in ("left", "right"):
+                arm = None #Let the actuator planner pick the default arm automatically
+            follow = max(0.0, min(0.08, float(item.get("follow", 0.0))))
+            skills.append({
+                "skill": "grab",
+                "object": obj,
+                "arm": arm,
+                "follow": follow,
+                "attempt": 0,
+            })
+
     return skills, notes
 
 

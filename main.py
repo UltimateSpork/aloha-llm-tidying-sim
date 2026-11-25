@@ -306,7 +306,7 @@ def run_with_viewer():
 
     print("ALOHA tidy sim ready. Try: push red block | sweep left | sweep right | tidy everything | "
           "reset | quit")
-    with mujoco.viewer.launch_passive(model, data) as viewer:
+    with mujoco.viewer.launch_passive(model, data,show_left_ui= False, show_right_ui = False) as viewer:
         viewer.cam.lookat[:] = [0.0, -0.02, 0.28]
         viewer.cam.distance = 1.3
         viewer.cam.azimuth = 90

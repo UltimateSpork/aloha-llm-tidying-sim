@@ -472,7 +472,7 @@ def plan_push_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
     return best
 
 
-def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, start_ctrl, target_xy):
+def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, start_ctrl, target_xy):
     """Plan hover -> descend -> close -> lift -> carry to bin -> release -> retract."""
     grip_open = amap["hi"][arm["grip_act"]]
     grip_closed = amap["lo"][arm["grip_act"]]
@@ -594,7 +594,7 @@ def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
     best_score = 999.0
     for side in candidates:
         if kind == "grab":
-            plan = plan_grab_for_arm(model, scratch, amap, amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
+            plan = plan_grab_for_arm(model, scratch, amap ,amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
         else:
             plan = plan_push_for_arm(model, scratch, amap, amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
         if plan is None:
