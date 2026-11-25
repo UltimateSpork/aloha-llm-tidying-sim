@@ -310,7 +310,7 @@ def parse_prompt(text, positions):
          elif "right" in words:
              side = "right"
          skills.append({"skill": "drop", "arm": side})
-        elif verb == "return":  #drops the object
+        elif verb == "return":  #returns the arm
          side = None
          if "left" in words:
              side = "left"
@@ -348,7 +348,7 @@ def solve_ik(model, scratch, arm, target, q_seed):
         mujoco.mj_comPos(model, scratch)
 
         rotation = scratch.xmat[arm["ee_body"]].reshape(3, 3)
-        r = rotation @ arm["tip_local"]                       # link origin -> fingertip (world frame)
+        r = rotation @ arm["tip_local"]
         tip = scratch.xpos[arm["ee_body"]] + r
         pos_error = target - tip
         error = float(np.linalg.norm(pos_error))
@@ -383,9 +383,6 @@ def solve_ik(model, scratch, arm, target, q_seed):
     return q, error
 
 
-# ----------------------------------------------------------------------------------------
-# Keyframe planning
-# ----------------------------------------------------------------------------------------
 def make_keyframe(ctrl, duration, label, via=None):
     """A keyframe: reach `ctrl` in `duration` seconds, optionally passing through `via` poses."""
     if via is None:
@@ -551,7 +548,7 @@ def plan_drop_for_arm(amap, arm,start_ctrl):
 
     keyframes = [
         make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 0.5, arm["side"] + ": open gripper"),
-        make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 0.4, arm["side"] + ": hold open"),
+        make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 1.4, arm["side"] + ": hold open"),
         #make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_closed), 0.5, arm["side"] + ": close gripper"),
         #make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_closed), 0.4, arm["side"] + ": hold close"),
     ]
