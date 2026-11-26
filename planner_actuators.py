@@ -9,7 +9,7 @@ TABLE_THICKNESS = 0.04
 GRASP_LIFT_DZ = 0.08      # height lifted above object center during carry
 GRASP_CLEAR_DZ = 0.02     # small clearance above grasp center on approach
 BIN_CENTER_XY = np.array([0.0, -0.019])
-BIN_RADIUS = 0.07 # an object is "in the bin" if its centre is within this distance
+BIN_RADIUS = 0.07  # an object is "in the bin" if its centre is within this distance
 
 # Objects
 OBJECT_SPECS = {
@@ -134,7 +134,7 @@ def on_table(pos):
     return pos[2] > TABLE_TOP_Z - 0.03
 
 
-# Prompt parsing
+# Prompt parsing (rule-based fallback)
 def has_word(words, options):
     """True if any of the options appears in the list of words."""
     for option in options:
@@ -166,9 +166,9 @@ def match_objects(words, names):
 def make_push(name, arm, follow):
     return {"skill": "push", "object": name, "arm": arm, "follow": follow, "attempt": 0}
 
+
 def make_grab(name, arm, follow):
     return {"skill": "grab", "object": name, "arm": arm, "follow": follow, "attempt": 0}
-
 
 
 def sort_by_bin_distance(names, positions):
@@ -176,15 +176,24 @@ def sort_by_bin_distance(names, positions):
     return sorted(names, key=lambda n: dist_to_bin(positions[n]))
 
 
+def side_from_words(words):
+    if "left" in words:
+        return "left"
+    if "right" in words:
+        return "right"
+    return None
+
+
 def parse_prompt(text, positions):
     """Turn a prompt into (skills, notes).
 
     Skill dicts look like:
       {"skill": "push", "object": name, "arm": None / "left" / "right", "follow": 0.0, "attempt": 0}
+      {"skill": "grab", "object": name, "arm": None / "left" / "right", "follow": 0.0, "attempt": 0}
       {"skill": "sweep", "side": "left" / "right"}     (empty sweep stroke)
+      {"skill": "drop", "arm": None / "left" / "right"}
+      {"skill": "return", "arm": None / "left" / "right"}
       {"skill": "reset"}
-      {"skill: grab", "object":name, "arm": None / "left" / "right", "follow": 0.0, "attempt": 0}
-      {"skil: drop", "object:name", "arm":None / "left" / "right", "follow": 0.0, "attempt: 0"}
     "tidy everything" and "sweep <side>" are expanded using the current object positions.
     """
     skills = []
@@ -206,7 +215,7 @@ def parse_prompt(text, positions):
             words.append(SYNONYMS.get(w, w))
         objs = match_objects(words, names)
 
-        if has_word(words, ["reset", "restart", "home"]):
+        if has_word(words, ["reset", "restart"]):
             skills.append({"skill": "reset"})
             last_verb = "reset"
             continue
@@ -221,17 +230,17 @@ def parse_prompt(text, positions):
             verb = "push"
         elif has_word(words, ["tidy", "clean", "clear"]):
             verb = "push"
-        elif has_word(words, ["grab","pick","take"]):
+        elif has_word(words, ["grab", "pick", "take"]):
             verb = "grab"
-        elif has_word(words, ["drop", "release", "let", "go"]):
+        elif has_word(words, ["drop", "release", "let"]):
             verb = "drop"
-        elif has_word(words, ["return", "back", "reposition"]):
+        elif has_word(words, ["return", "back", "home", "reposition"]):
             verb = "return"
         elif len(objs) > 0 and last_verb in ["push", "sweep", "tidy"]:
             verb = "push"       # e.g. "push red block and blue ball"
         if verb is None:
             notes.append("Didn't understand '" + clause + "'. Try: push red block | sweep left | "
-                         "sweep right | tidy everything | reset")
+                         "tidy everything | grab blue ball | drop | return | reset")
             continue
         last_verb = verb
 
@@ -246,11 +255,7 @@ def parse_prompt(text, positions):
                 skills.append(make_push(n, None, 0.0))
 
         elif verb == "sweep":
-            side = None
-            if "left" in words:
-                side = "left"
-            elif "right" in words:
-                side = "right"
+            side = side_from_words(words)
             if len(objs) > 0:
                 for n in objs:
                     if not in_bin(positions[n]):
@@ -286,39 +291,34 @@ def parse_prompt(text, positions):
                     notes.append(n + " is already in the bin.")
                 else:
                     skills.append(make_push(n, None, 0.0))
-        elif verb == "grab": # Picks up object
-            side = None
-            if "left" in words:
-                side = "left"
-            else:
-                side = "right"
-                            # The left arm owns the table half with x < centre, the right arm the other half.
-            mine = []
-            for n in names:
-                left_half = positions[n][0] < TABLE_CENTER_XY[0]
-                if (side == "left") == left_half and on_table(positions[n]):
-                    mine.append(n)
-            if len(mine) == 0:
-                notes.append("No loose objects on the " + side )
-                skills.append({"skill": "grab", "side": side})
-            for n in sort_by_bin_distance(mine, positions):
-                skills.append(make_grab(n, side, 0.03))
-        elif verb == "drop":  #drops the object
-         side = None
-         if "left" in words:
-             side = "left"
-         elif "right" in words:
-             side = "right"
-         skills.append({"skill": "drop", "arm": side})
-        elif verb == "return":  #returns the arm
-         side = None
-         if "left" in words:
-             side = "left"
-         elif "right" in words:
-             side = "right"
-         skills.append({"skill": "return", "arm": side})
+
+        elif verb == "grab":
+            side = side_from_words(words)
+            if len(objs) == 0 and side is not None:
+                # "grab left": take the loose objects on that arm's half of the table
+                for n in names:
+                    left_half = positions[n][0] < TABLE_CENTER_XY[0]
+                    if (side == "left") == left_half and on_table(positions[n]) and not in_bin(positions[n]):
+                        objs.append(n)
+            if len(objs) == 0:
+                notes.append("Grab which object? Known objects: " + ", ".join(names))
+                continue
+            for n in sort_by_bin_distance(objs, positions):
+                if not on_table(positions[n]):
+                    notes.append(n + " is not on the table.")
+                elif in_bin(positions[n]):
+                    notes.append(n + " is already in the bin.")
+                else:
+                    skills.append(make_grab(n, side, 0.0))
+
+        elif verb == "drop":
+            skills.append({"skill": "drop", "arm": side_from_words(words)})
+
+        elif verb == "return":
+            skills.append({"skill": "return", "arm": side_from_words(words)})
 
     return skills, notes
+
 
 # Damped least-squares IK
 def skew(v):
@@ -487,7 +487,12 @@ def plan_push_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
 
 
 def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, start_ctrl, target_xy):
-    """Plan hover -> descend -> close -> lift -> carry to bin -> release -> retract."""
+    """Plan pre-grasp -> descend -> close -> lift -> carry above the bin.
+
+    The gripper stays closed at the end. Use a "drop" skill to release the object and a "return"
+    skill to send the arm home. (To make grab a single atomic action, append a release keyframe and
+    a retract keyframe here.)
+    """
     grip_open = amap["hi"][arm["grip_act"]]
     grip_closed = amap["lo"][arm["grip_act"]]
 
@@ -497,20 +502,13 @@ def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
     grasp_tip = np.array([xy[0], xy[1], grasp_z])
     lift_tip = np.array([xy[0], xy[1], grasp_z + GRASP_LIFT_DZ])
     drop_hover_tip = np.array([target_xy[0], target_xy[1], grasp_z + GRASP_LIFT_DZ + GRASP_CLEAR_DZ])
-    drop_tip = np.array([target_xy[0], target_xy[1], grasp_z + GRASP_LIFT_DZ])
 
     q_hover, err1 = solve_ik(model, scratch, arm, hover_tip, arm["home_q"])
     q_grasp, err2 = solve_ik(model, scratch, arm, grasp_tip, q_hover)
     q_lift, err3 = solve_ik(model, scratch, arm, lift_tip, q_grasp)
     q_drop_hover, err4 = solve_ik(model, scratch, arm, drop_hover_tip, q_lift)
-    q_drop, err5 = solve_ik(model, scratch, arm, drop_tip, q_drop_hover)
 
-    worst = max(err1, err2, err3, err4, err5)
-
-    home_ctrl = start_ctrl.copy()
-    home_ctrl[arm["act_ids"]] = amap["home"][arm["act_ids"]]
-    home_ctrl[arm["grip_act"]] = grip_open
-
+    worst = max(err1, err2, err3, err4)
     carry_time = max(1.2, float(np.linalg.norm(target_xy - xy)) / 0.08)
 
     keyframes = [
@@ -524,10 +522,6 @@ def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
                       arm["side"] + ": lift"),
         make_keyframe(make_ctrl(amap, start_ctrl, arm, q_drop_hover, grip_closed), carry_time,
                       arm["side"] + ": carry to bin"),
-        # make_keyframe(make_ctrl(amap, start_ctrl, arm, q_drop, grip_open), 0.5,
-        #               arm["side"] + ": release"),
-        # make_keyframe(clamp_ctrl(amap, home_ctrl), duration_for(q_drop, arm["home_q"], 0.9, 1.0),
-        #               arm["side"] + ": retract"),
     ]
 
     return {
@@ -539,18 +533,20 @@ def plan_grab_for_arm(model, scratch, amap, arm, p_obj, r_obj, follow, attempt, 
         "description": "",
     }
 
-def plan_drop_for_arm(amap, arm,start_ctrl):
 
+def gripper_is_closed(amap, arm, ctrl):
+    mid = 0.5 * (amap["lo"][arm["grip_act"]] + amap["hi"][arm["grip_act"]])
+    return float(ctrl[arm["grip_act"]]) < mid
+
+
+def plan_drop_for_arm(amap, arm, start_ctrl):
+    """Open the gripper in place (releases whatever it holds)."""
     grip_open = amap["hi"][arm["grip_act"]]
-    grip_closed = amap["lo"][arm["grip_act"]]
     hold_q = start_ctrl[arm["act_ids"]].copy()
-
 
     keyframes = [
         make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 0.5, arm["side"] + ": open gripper"),
         make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_open), 1.4, arm["side"] + ": hold open"),
-        #make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_closed), 0.5, arm["side"] + ": close gripper"),
-        #make_keyframe(make_ctrl(amap, start_ctrl, arm, hold_q, grip_closed), 0.4, arm["side"] + ": hold close"),
     ]
 
     return {
@@ -561,6 +557,7 @@ def plan_drop_for_arm(amap, arm,start_ctrl):
         "reset_objects": False,
         "description": "drop/release with " + arm["side"] + " arm",
     }
+
 
 def plan_return_for_arm(amap, start_ctrl, side=None):
     """Return one arm (or both arms if side is None) back to home."""
@@ -591,6 +588,7 @@ def plan_return_for_arm(amap, start_ctrl, side=None):
         "description": "return " + label_side + " to home",
     }
 
+
 def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
     """Turn one skill dict into a plan using the CURRENT object positions.
 
@@ -609,78 +607,61 @@ def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
                 "reset_objects": True, "description": "reset"}
         return plan, messages
 
-    if kind == "sweep":                               # empty sweep: a push stroke with no object
-            if "object" not in skill:
-                side = skill.get("side", "left")
-                sign = -1.0 if side == "left" else 1.0
-                p_obj = np.array([sign * 0.17, TABLE_CENTER_XY[1], 0.0])
-                r_obj = 0.0
-                follow = 0.0
-                attempt = 0
-                forced_arm = side
-                name = "empty " + side + " sweep"
-                n_in_bin = 0
-            else:
-                name = skill["object"]
-                if not on_table(positions[name]):
-                    return None, [name + " is not on the table any more."]
-                p_obj = positions[name]
-                r_obj = OBJECT_SPECS[name]["radius"]
-                follow = skill["follow"]
-                attempt = skill["attempt"]
-                forced_arm = skill["arm"]
-                n_in_bin = sum(1 for other in positions if other != name and in_bin(positions[other]))
-
     if kind == "drop":
         side = skill.get("arm") or skill.get("side")
         if side not in SIDES:
+            # No arm given: use the arm that is currently holding something (closed gripper).
             side = "left"
-        plan = plan_drop_for_arm(amap, amap[side], start_ctrl)
-        return plan, messages
-    elif kind == "return":
+            for s in SIDES:
+                if gripper_is_closed(amap, amap[s], start_ctrl):
+                    side = s
+                    break
+        return plan_drop_for_arm(amap, amap[side], start_ctrl), messages
+
+    if kind == "return":
         side = skill.get("arm") or skill.get("side")
-        if side not in SIDES:
-            side = None
-        plan = plan_return_for_arm(amap, start_ctrl, side=side)
-        return plan, messages
+        return plan_return_for_arm(amap, start_ctrl, side=side if side in SIDES else None), messages
+
+    if kind == "sweep" and "object" not in skill:     # empty sweep: a push stroke with no object
+        side = skill.get("side", "left")
+        sign = -1.0 if side == "left" else 1.0
+        p_obj = np.array([sign * 0.17, TABLE_CENTER_XY[1], 0.0])
+        r_obj, follow, attempt = 0.0, 0.0, 0
+        forced_arm = side
+        name = "empty " + side + " sweep"
+        n_in_bin = 0
+        kind = "push"
     else:
         if "object" not in skill:
             return None, ["No target object specified for " + kind + "."]
         name = skill["object"]
+        if name not in positions:
+            return None, ["Unknown object " + str(name) + "."]
         if not on_table(positions[name]):
             return None, [name + " is not on the table any more."]
         p_obj = positions[name]
         r_obj = OBJECT_SPECS[name]["radius"]
         follow = skill.get("follow", 0.0)
         attempt = skill.get("attempt", 0)
-        forced_arm = skill.get("arm")
+        forced_arm = skill.get("arm") or skill.get("side")
         n_in_bin = sum(1 for other in positions if other != name and in_bin(positions[other]))
+        if kind == "sweep":
+            kind = "push"
 
     target_xy = bin_slot(p_obj, n_in_bin)
-    if p_obj[0] < TABLE_CENTER_XY[0]:
-        preferred = "left"
-    else:
-        preferred = "right"
-
-    if forced_arm is not None:
-        candidates = [forced_arm]
-    else:
-        candidates = SIDES
+    preferred = "left" if p_obj[0] < TABLE_CENTER_XY[0] else "right"
+    candidates = [forced_arm] if forced_arm in SIDES else SIDES
 
     best_plan = None
     best_score = 999.0
     for side in candidates:
         if kind == "grab":
-            plan = plan_grab_for_arm(model, scratch, amap ,amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
-        elif kind == "push":
-            plan = plan_push_for_arm(model, scratch, amap, amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
-        elif kind == "drop":
-            plan = plan_drop_for_arm(model, scratch, amap ,amap[side], p_obj, r_obj, follow, attempt,start_ctrl, target_xy)
-            return plan, messages
-        elif kind == "return":
-            plan = plan_return_for_arm(amap,start_ctrl,amap[side])
-            return plan, messages
-        elif plan is None:
+            plan = plan_grab_for_arm(model, scratch, amap, amap[side], p_obj, r_obj, follow, attempt,
+                                     start_ctrl, target_xy)
+        else:
+            plan = plan_push_for_arm(model, scratch, amap, amap[side], p_obj, r_obj, follow, attempt,
+                                     start_ctrl, target_xy)
+        if plan is None:
             continue
         score = plan["max_err"]
         if side != preferred:
@@ -690,12 +671,12 @@ def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
             best_plan = plan
 
     if best_plan is None:
-        return None, ["Could not plan a push for " + name + "."]
+        return None, ["Could not plan a " + kind + " for " + name + "."]
     if best_plan["max_err"] > MAX_ACCEPT_ERR:
         return None, [name + ": neither arm can reach (IK error " +
                       str(round(best_plan["max_err"] * 100, 1)) + " cm)."]
     if best_plan["approximate"]:
         messages.append(name + ": the " + best_plan["arm"] + " arm only approximately reaches (IK error " +
                         str(round(best_plan["max_err"] * 100, 1)) + " cm).")
-    best_plan["description"] = skill["skill"] + " " + name + " with " + best_plan["arm"] + " arm"
+    best_plan["description"] = kind + " " + name + " with " + best_plan["arm"] + " arm"
     return best_plan, messages

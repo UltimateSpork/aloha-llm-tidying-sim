@@ -1,18 +1,20 @@
+"""One-shot prompt parser + episode memory (the memory part is also used by agent.py)."""
 import json
 import os
+from pathlib import Path
+
 import ollama
 
 import planner_actuators as pa
 
 DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
-
-from pathlib import Path
-
 MEMORY_PATH = Path(__file__).resolve().parent / "memory_log.jsonl"
 
 
+# Memory
+
 def load_recent_episodes(limit=5, prompt_text=""):
-    """Load recent episodes from memory_log.jsonl, prioritizing shared keywords."""
+    """Load episodes from memory_log.jsonl, prioritizing ones that share keywords with the prompt."""
     if not MEMORY_PATH.exists():
         return []
 
@@ -44,12 +46,11 @@ def load_recent_episodes(limit=5, prompt_text=""):
         return (overlap, idx)
 
     ranked = sorted(enumerate(episodes), key=score_entry, reverse=True)
-    chosen = [ep for _, ep in ranked[:limit]]
-    return chosen
+    return [ep for _, ep in ranked[:limit]]
 
 
 def format_episodes_for_prompt(episodes):
-    """Format past episodes into a compact block for qwen2.5:3b."""
+    """Format past episodes into a compact block for the prompt."""
     if not episodes:
         return ""
     lines = ["Past episodes (learn from outcomes; avoid repeating failed approaches):"]
@@ -57,13 +58,13 @@ def format_episodes_for_prompt(episodes):
         skill_names = [s.get("skill") for s in ep.get("skills", []) if isinstance(s, dict)]
         status = "OK" if ep.get("success") else "CHECK"
         lines.append(
-            f"- [{status}] prompt='{ep.get('prompt', '')}' -> skills={skill_names} | outcome={ep.get('outcome', '')}"
+            f"- [{status}] prompt='{ep.get('prompt', '')}' -> actions={skill_names} | outcome={ep.get('outcome', '')}"
         )
     return "\n".join(lines)
 
 
 def record_episode(prompt_text, skills, outcome, success=True):
-    """Append a completed skill execution episode to memory_log.jsonl."""
+    """Append a completed episode to memory_log.jsonl."""
     entry = {
         "prompt": prompt_text,
         "skills": skills,
@@ -76,8 +77,11 @@ def record_episode(prompt_text, skills, outcome, success=True):
     except OSError:
         pass
 
+
+# One-shot parser (used for typed commands without the "task " prefix)
+
 def build_skill_schema(object_names):
-    """JSON schema constraining qwen2.5:3b output to valid skill dictionaries."""
+    """JSON schema constraining the model output to valid skill dictionaries."""
     return {
         "type": "object",
         "additionalProperties": False,
@@ -169,15 +173,9 @@ def normalize_skills(raw_skills, positions):
             if pa.in_bin(positions[obj]):
                 notes.append(f"{obj} is already in the bin.")
                 continue
-            arm = item.get("arm") if item.get("arm") in ("left", "right") else None
+            arm = _extract_arm_or_side(item)
             follow = max(0.0, min(0.08, float(item.get("follow", 0.0))))
-            skills.append({
-                "skill": "push",
-                "object": obj,
-                "arm": arm,
-                "follow": follow,
-                "attempt": 0,
-            })
+            skills.append({"skill": "push", "object": obj, "arm": arm, "follow": follow, "attempt": 0})
 
         elif kind == "grab":
             obj = item.get("object")
@@ -189,28 +187,19 @@ def normalize_skills(raw_skills, positions):
                 continue
             arm = _extract_arm_or_side(item)
             follow = max(0.0, min(0.08, float(item.get("follow", 0.0))))
-            skills.append({
-                "skill": "grab",
-                "object": obj,
-                "arm": arm,
-                "follow": follow,
-                "attempt": 0,
-            })
+            skills.append({"skill": "grab", "object": obj, "arm": arm, "follow": follow, "attempt": 0})
 
         elif kind == "drop":
-            arm = _extract_arm_or_side(item)
-            skills.append({"skill": "drop", "arm": arm})
+            skills.append({"skill": "drop", "arm": _extract_arm_or_side(item)})
 
         elif kind == "return":
-            arm = _extract_arm_or_side(item)
-            skills.append({"skill": "return", "arm": arm})
+            skills.append({"skill": "return", "arm": _extract_arm_or_side(item)})
 
     return skills, notes
 
 
 def parse_prompt_ollama(text, positions, model=DEFAULT_MODEL):
-    """Query local Ollama via the ollama package; return (skills, notes) or None on failure."""
-    
+    """Query local Ollama; return (skills, notes) or None on failure."""
     scene_json = json.dumps(summarize_scene(positions))
     schema = build_skill_schema(positions.keys())
     past_episodes = load_recent_episodes(limit=5, prompt_text=text)
@@ -221,27 +210,27 @@ def parse_prompt_ollama(text, positions, model=DEFAULT_MODEL):
         user_content = f"{memory_block}\n\n{user_content}"
 
     system_msg = (
-            "Map the user prompt and scene state to skill dicts.\n"
-            "Rules:\n"
-            "- For pushing/sliding an object into the bin: skill='push', object=<name>, arm=null (or 'left'/'right' if forced), side=null, follow=0.0.\n"
-            "- For grabbing/picking up an object: skill='grab', object=<name>, arm=null (or 'left'/'right' if forced), side=null, follow=0.0.\n"
-            "- For opening/closing the claw / dropping / releasing: skill='drop', object=null, arm='left'|'right'|null, side=null, follow=0.0.\n"
-            "- For returning arm(s) to home pose: skill='return', object=null, arm='left'|'right'|null, side=null, follow=0.0.\n"
-            "- For sweeping a side: skill='sweep', side='left'|'right', object=null, arm=null, follow=0.0.\n"
-            "- For full scene reset: skill='reset', object=null, arm=null, side=null, follow=0.0.\n"
-            "- Skip objects where in_bin is true unless explicitly asked.\n"
-            "- For multiple objects ('tidy everything' / 'clear table'), order nearest dist_to_bin first.\n"
-            "- Keep 'note' brief or empty.\n\n"
-            "Examples:\n"
-            "Prompt: 'grab the red block'\n"
-            "Output: {\"skills\":[{\"skill\":\"grab\",\"object\":\"red_block\",\"arm\":null,\"side\":null,\"follow\":0.0}],\"note\":\"\"}\n"
-            "Prompt: 'drop it and return right arm'\n"
-            "Output: {\"skills\":[{\"skill\":\"drop\",\"object\":null,\"arm\":null,\"side\":null,\"follow\":0.0},{\"skill\":\"return\",\"object\":null,\"arm\":\"right\",\"side\":null,\"follow\":0.0}],\"note\":\"\"}\n"
-            "Prompt: 'pick up blue ball with left arm'\n"
-            "Output: {\"skills\":[{\"skill\":\"grab\",\"object\":\"blue_ball\",\"arm\":\"left\",\"side\":null,\"follow\":0.0}],\"note\":\"\"}\n"
-            "Prompt: 'reset everything'\n"
-            "Output: {\"skills\":[{\"skill\":\"reset\",\"object\":null,\"arm\":null,\"side\":null,\"follow\":0.0}],\"note\":\"\"}"
-        )
+        "Map the user prompt and scene state to skill dicts.\n"
+        "Rules:\n"
+        "- For pushing/sliding an object into the bin: skill='push', object=<name>, arm=null (or 'left'/'right' if forced), side=null, follow=0.0.\n"
+        "- For grabbing/picking up an object: skill='grab', object=<name>, arm=null (or 'left'/'right' if forced), side=null, follow=0.0.\n"
+        "- For opening/closing the claw / dropping / releasing: skill='drop', object=null, arm='left'|'right'|null, side=null, follow=0.0.\n"
+        "- For returning arm(s) to home pose: skill='return', object=null, arm='left'|'right'|null, side=null, follow=0.0.\n"
+        "- For sweeping a side: skill='sweep', side='left'|'right', object=null, arm=null, follow=0.0.\n"
+        "- For full scene reset: skill='reset', object=null, arm=null, side=null, follow=0.0.\n"
+        "- Skip objects where in_bin is true unless explicitly asked.\n"
+        "- For multiple objects ('tidy everything' / 'clear table'), order nearest dist_to_bin first.\n"
+        "- Keep 'note' brief or empty.\n\n"
+        "Examples:\n"
+        "Prompt: 'grab the red block'\n"
+        "Output: {\"skills\":[{\"skill\":\"grab\",\"object\":\"red_block\",\"arm\":null,\"side\":null,\"follow\":0.0}],\"note\":\"\"}\n"
+        "Prompt: 'drop it and return right arm'\n"
+        "Output: {\"skills\":[{\"skill\":\"drop\",\"object\":null,\"arm\":null,\"side\":null,\"follow\":0.0},{\"skill\":\"return\",\"object\":null,\"arm\":\"right\",\"side\":null,\"follow\":0.0}],\"note\":\"\"}\n"
+        "Prompt: 'pick up blue ball with left arm'\n"
+        "Output: {\"skills\":[{\"skill\":\"grab\",\"object\":\"blue_ball\",\"arm\":\"left\",\"side\":null,\"follow\":0.0}],\"note\":\"\"}\n"
+        "Prompt: 'reset everything'\n"
+        "Output: {\"skills\":[{\"skill\":\"reset\",\"object\":null,\"arm\":null,\"side\":null,\"follow\":0.0}],\"note\":\"\"}"
+    )
 
     try:
         response = ollama.chat(
@@ -251,7 +240,7 @@ def parse_prompt_ollama(text, positions, model=DEFAULT_MODEL):
             options={"temperature": 0},
             messages=[
                 {"role": "system", "content": system_msg},
-                {"role": "user", "content": f"Scene: {scene_json}\nPrompt: {text}"},
+                {"role": "user", "content": user_content},     # includes the memory block
             ],
         )
     except Exception:

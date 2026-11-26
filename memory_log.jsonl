@@ -1,0 +1,1 @@
+{"prompt": "put both objects in the bin", "skills": [{"skill": "get_scene", "args": {}}, {"skill": "grab_object", "args": {"object": "red_block", "arm": "left"}}, {"skill": "grab_object", "args": {"object": "blue_ball", "arm": "right"}}], "outcome": "Both objects put into the bin.", "success": true}

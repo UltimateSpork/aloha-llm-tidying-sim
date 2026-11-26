@@ -10,6 +10,7 @@ import numpy as np
 
 import planner_actuators as pa
 import llm as op
+import agent as ag
 
 MAX_AUTO_RETRIES = 2
 PROMPT = "> "
@@ -34,9 +35,9 @@ def add_object(spec, name):
 
 def build_scene():
     """Build ALOHA + table + bin + objects. Returns (model, data, home_ctrl)."""
-    spec = mm.get("aloha").spec("aloha") # the robot we are using
+    spec = mm.get("aloha").spec("aloha")  # the robot we are using
 
-    # Save the robot's neutral pose, then remove the keyframe 
+    # Save the robot's neutral pose, then remove the keyframe
     home_ctrl = np.array(spec.keys[0].ctrl, dtype=float)
     for key in list(spec.keys):
         spec.delete(key)
@@ -149,6 +150,28 @@ def make_sim(model, data, amap):
     }
 
 
+def submit_skills(sim, skills, check_targets=True):
+    """Queue a list of skill dicts and start running them.
+
+    check_targets=True  -> after the skills finish, verify pushed objects are in the bin and
+                           automatically re-push (the classic behaviour).
+    check_targets=False -> no automatic check (used by the agent, which verifies by itself).
+    """
+    sim["skills"] = list(skills)
+    sim["targets"] = []
+    if check_targets:
+        for skill in skills:
+            if skill["skill"] == "push" and skill["object"] not in sim["targets"]:
+                sim["targets"].append(skill["object"])
+    sim["retries"] = 0
+    print("[Plan] " + str(len(skills)) + " skill(s) queued")
+    start_next_skill(sim)
+
+
+def submit_agent_skills(sim, skills):
+    submit_skills(sim, skills, check_targets=False)
+
+
 def submit_prompt(sim, text):
     """Parse a typed prompt (via Ollama first, with rule-based fallback) and start running it."""
     text = text.strip()
@@ -173,14 +196,8 @@ def submit_prompt(sim, text):
         show_prompt()
         return
 
-    sim["skills"] = skills
-    sim["targets"] = []
-    for skill in skills:
-        if skill["skill"] == "push" and skill["object"] not in sim["targets"]:
-            sim["targets"].append(skill["object"])
-    sim["retries"] = 0
-    print("[Plan] " + str(len(skills)) + " skill(s) queued")
-    start_next_skill(sim)
+    submit_skills(sim, skills)
+
 
 def start_next_skill(sim):
     """Plan the next skill in the queue and start playing it. If none are left, start settling."""
@@ -207,7 +224,7 @@ def start_next_skill(sim):
 
 def interpolate(start, keyframe, alpha):
     """Control vector at progress alpha (0..1) of a keyframe, using cosine easing."""
-    u = 0.5 - 0.5 * np.cos(np.pi * alpha)# smooth 0 -> 1 with zero speed at both ends
+    u = 0.5 - 0.5 * np.cos(np.pi * alpha)  # smooth 0 -> 1 with zero speed at both ends
     points = [start] + keyframe["via"] + [keyframe["ctrl"]]
     if len(points) == 2:
         return points[0] + (points[1] - points[0]) * u
@@ -226,7 +243,7 @@ def step_motion(sim):
     ctrl = interpolate(sim["start_ctrl"], keyframe, alpha)
     sim["data"].ctrl[:] = pa.clamp_ctrl(sim["amap"], ctrl)
 
-    if alpha >= 1.0: # keyframe finished
+    if alpha >= 1.0:  # keyframe finished
         sim["start_ctrl"] = keyframe["ctrl"].copy()
         sim["t"] = 0.0
         if len(sim["keyframes"]) > 0:
@@ -298,15 +315,24 @@ def make_simulation():
     return model, data, make_sim(model, data, amap)
 
 
+def start_agent(bridge, task):
+    bridge.agent_running = True
+    print("[Agent] task: " + task)
+    threading.Thread(target=ag.run_agent, args=(task, bridge), daemon=True).start()
+
+
 def run_with_viewer():
     model, data, sim = make_simulation()
+    bridge = ag.Bridge()
     lines = start_input_thread()
     dt = model.opt.timestep
-    steps_per_frame = max(1, round(1.0 / 60.0 / dt))# about 60 screen updates per second
+    steps_per_frame = max(1, round(1.0 / 60.0 / dt))  # about 60 screen updates per second
 
-    print("ALOHA tidy sim ready. Try: push red block | sweep left | sweep right | tidy everything | "
-          "reset | quit")
-    with mujoco.viewer.launch_passive(model, data,show_left_ui= False, show_right_ui = False) as viewer:
+    print("ALOHA tidy sim ready.\n"
+          "  Commands: push red block | sweep left | tidy everything | grab blue ball | drop | "
+          "return | reset | quit\n"
+          "  Agent:    task <anything>   e.g. 'task put both objects in the bin'")
+    with mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False) as viewer:
         viewer.cam.lookat[:] = [0.0, -0.02, 0.28]
         viewer.cam.distance = 1.3
         viewer.cam.azimuth = 90
@@ -316,12 +342,19 @@ def run_with_viewer():
         while viewer.is_running() and not sim["quit"]:
             frame_start = time.perf_counter()
 
-            if sim["mode"] == "idle": # take a new command only when not busy
+            # Take a new command only when the sim and the agent are both free.
+            if sim["mode"] == "idle" and not bridge.agent_running:
                 try:
                     text = lines.get_nowait()
-                    submit_prompt(sim, text)
+                    if text.lower().startswith("task "):
+                        start_agent(bridge, text[5:].strip())
+                    else:
+                        submit_prompt(sim, text)
                 except queue.Empty:
                     pass
+
+            # Serve requests coming from the agent thread.
+            bridge.pump(sim, submit_agent_skills)
 
             for i in range(steps_per_frame):
                 update(sim)
@@ -334,7 +367,7 @@ def run_with_viewer():
 
 
 def run_headless(commands):
-    """Run commands without a viewer (handy for testing)."""
+    """Run commands without a viewer (handy for testing). Agent tasks are not supported here."""
     model, data, sim = make_simulation()
     for command in commands:
         print(PROMPT + command)
