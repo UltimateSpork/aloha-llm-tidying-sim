@@ -71,55 +71,55 @@ def observe(sim):
 
 # Thread bridge
 
-class Bridge:
-    """Lets the agent thread request work that must run on the main (sim) thread."""
+def make_bridge():
+    """State shared between the agent thread and the main (sim) thread, in one dictionary."""
+    return {"q": queue.Queue(),          # jobs waiting for the main thread
+            "active": None,              # job currently running on the main thread
+            "agent_running": False}
 
-    def __init__(self):
-        self.q = queue.Queue()
-        self.active = None
-        self.agent_running = False
 
-    def call(self, kind, skill=None, timeout=300):
-        """Called from the agent thread. Blocks until the main thread has finished the job.
+def bridge_call(bridge, kind, skill=None, timeout=300):
+    """Called from the agent thread. Blocks until the main thread has finished the job.
 
-        kind: "state" (latest belief, instant), "look" (take a new picture first) or "skill".
-        """
-        job = {"kind": kind, "skill": skill, "done": threading.Event(),
-               "result": None, "log": []}
-        self.q.put(job)
-        if not job["done"].wait(timeout):
-            return {"error": "timed out"}
-        return job["result"]
+    kind: "state" (latest belief, instant), "look" (take a new picture first) or "skill".
+    """
+    job = {"kind": kind, "skill": skill, "done": threading.Event(),
+           "result": None, "log": []}
+    bridge["q"].put(job)
+    if not job["done"].wait(timeout):
+        return {"error": "timed out"}
+    return job["result"]
 
-    def pump(self, sim, submit_skills):
-        """Called once per frame from the main loop."""
-        # 1. A running job is finished once the sim is idle again and the picture is up to date.
-        if self.active is not None and sim["mode"] == "idle":
-            if sim["vision_on"] and sim["belief_stale"]:
-                vis.start_perception(sim, lambda s: None)       # look before reporting back
-                return
-            job, self.active = self.active, None
-            job["result"] = {"planner_log": job["log"], **observe(sim)}
+
+def pump_bridge(bridge, sim, submit_skills):
+    """Called once per frame from the main loop."""
+    # 1. A running job is finished once the sim is idle again and the picture is up to date.
+    if bridge["active"] is not None and sim["mode"] == "idle":
+        if sim["vision_on"] and sim["belief_stale"]:
+            vis.start_perception(sim, lambda s: None)       # look before reporting back
+            return
+        job, bridge["active"] = bridge["active"], None
+        job["result"] = {"planner_log": job["log"], **observe(sim)}
+        job["done"].set()
+
+    # 2. Start the next queued job.
+    if bridge["active"] is None and sim["mode"] == "idle" and not bridge["q"].empty():
+        job = bridge["q"].get_nowait()
+        if job["kind"] == "state":
+            job["result"] = observe(sim)
             job["done"].set()
-
-        # 2. Start the next queued job.
-        if self.active is None and sim["mode"] == "idle" and not self.q.empty():
-            job = self.q.get_nowait()
-            if job["kind"] == "state":
-                job["result"] = observe(sim)
-                job["done"].set()
-            elif job["kind"] == "look":
-                if sim["vision_on"]:
-                    vis.start_perception(sim, lambda s: None)
-                self.active = job
-            else:
-                buf = io.StringIO()
-                with redirect_stdout(buf):               # capture planner messages
-                    submit_skills(sim, [job["skill"]])
-                job["log"] = [l for l in buf.getvalue().splitlines() if l.strip()]
-                if job["log"]:
-                    print("\n".join(job["log"]))
-                self.active = job
+        elif job["kind"] == "look":
+            if sim["vision_on"]:
+                vis.start_perception(sim, lambda s: None)
+            bridge["active"] = job
+        else:
+            buf = io.StringIO()
+            with redirect_stdout(buf):               # capture planner messages
+                submit_skills(sim, [job["skill"]])
+            job["log"] = [l for l in buf.getvalue().splitlines() if l.strip()]
+            if job["log"]:
+                print("\n".join(job["log"]))
+            bridge["active"] = job
 
 
 # Tools
@@ -131,7 +131,7 @@ def _tool(name, description, props=None, required=None):
                        "required": required or []}}}
 
 
-OBJ = {"type": "string", "enum": list(pa.ACTIVE_OBJECTS)}
+OBJ = {"type": "string", "enum": list(pa.OBJECT_SPECS)}   # whole catalog; run_tool rejects ones not on the table
 ARM = {"type": "string", "enum": ["left", "right"]}
 
 TOOLS = [
@@ -178,10 +178,10 @@ def run_tool(bridge, name, args):
     arm = args.get("arm") if args.get("arm") in pa.SIDES else None
 
     if name == "get_scene":
-        return bridge.call("look")
+        return bridge_call(bridge, "look")
 
     if name in ("push_to_bin", "grab_object"):
-        objs = bridge.call("state")["objects"]
+        objs = bridge_call(bridge, "state")["objects"]
         obj = args.get("object")
         if obj not in objs:
             return {"error": f"unknown object {obj!r}. Known: {list(objs)}"}
@@ -194,14 +194,14 @@ def run_tool(bridge, name, args):
         if objs[obj]["in_bin"]:
             return {"error": f"{obj} is already in the bin"}
         maker = pa.make_push if name == "push_to_bin" else pa.make_grab
-        return bridge.call("skill", maker(obj, arm, 0.0))
+        return bridge_call(bridge, "skill", maker(obj, arm, 0.0))
 
     if name == "release_gripper":
-        return bridge.call("skill", {"skill": "drop", "arm": arm})
+        return bridge_call(bridge, "skill", {"skill": "drop", "arm": arm})
     if name == "return_arm_home":
-        return bridge.call("skill", {"skill": "return", "arm": arm})
+        return bridge_call(bridge, "skill", {"skill": "return", "arm": arm})
     if name == "reset_scene":
-        return bridge.call("skill", {"skill": "reset"})
+        return bridge_call(bridge, "skill", {"skill": "reset"})
     return {"error": f"unknown tool {name}"}
 
 
@@ -233,7 +233,7 @@ def run_agent(task, bridge, model=MODEL):
                 print(f"[Agent] {name}({args})")
                 if name == "finish":
                     still = [f"{s} arm is holding {a['holding']}"
-                             for s, a in bridge.call("state")["arms"].items() if a.get("holding")]
+                             for s, a in bridge_call(bridge, "state")["arms"].items() if a.get("holding")]
                     if still and finish_blocks < 2:
                         finish_blocks += 1
                         messages.append({"role": "tool", "tool_name": name, "content": json.dumps(
@@ -261,5 +261,5 @@ def run_agent(task, bridge, model=MODEL):
     finally:
         print(f"[Agent] {'SUCCESS' if success else 'DONE'}: {summary}")
         llm.record_episode(task, trace, summary, success)
-        bridge.agent_running = False
+        bridge["agent_running"] = False
         print("> ", end="", flush=True)

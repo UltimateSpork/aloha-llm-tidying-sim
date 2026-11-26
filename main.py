@@ -13,28 +13,22 @@ import planner_actuators as pa
 import llm as op
 import agent as ag
 import vision as vis
+import objects as objs
 
 MAX_AUTO_RETRIES = 2
 PROMPT = "> "
 RANDOMIZE = os.environ.get("RANDOMIZE_OBJECTS", "1") != "0"     # random start layout
 SEED = os.environ.get("SIM_SEED")                                # fix it for repeatable layouts
+MIN_OBJECTS = int(os.environ.get("MIN_OBJECTS", "2"))           # how many objects appear on each reset
+MAX_OBJECTS = int(os.environ.get("MAX_OBJECTS", "4"))
+RANDOM_YAW = os.environ.get("RANDOM_YAW", "1") != "0"           # random rotation about the vertical axis
 
 
 # Environment Setup
 
 def add_object(spec, name):
-    """Add one free-moving object from pa.OBJECT_SPECS, resting on the table."""
-    cfg = pa.OBJECT_SPECS[name]
-    body = spec.worldbody.add_body(name=name, pos=[cfg["xy"][0], cfg["xy"][1], pa.object_rest_z(name)])
-    body.add_joint(name=name + "_joint", type=mujoco.mjtJoint.mjJNT_FREE, damping=cfg["damping"])
-    if cfg["shape"] == "box":
-        shape = mujoco.mjtGeom.mjGEOM_BOX
-        size = list(cfg["half"])
-    else:
-        shape = mujoco.mjtGeom.mjGEOM_SPHERE
-        size = [cfg["half"][0], 0, 0]
-    body.add_geom(name=name + "_geom", type=shape, size=size, rgba=list(cfg["rgba"]),
-                  mass=cfg["mass"], friction=list(cfg["friction"]))
+    """Add one catalog object (multi-geom, free-moving). It starts parked off to the side."""
+    objs.add_to_spec(spec, name)
 
 
 def build_scene():
@@ -83,7 +77,7 @@ def build_scene():
                        euler=[0, 0, np.degrees(angle) + 90], rgba=[0.1, 0.4, 0.2, 1],
                        contype=0, conaffinity=0)
 
-    for name in pa.ACTIVE_OBJECTS:
+    for name in pa.OBJECT_SPECS:          # the whole catalog is built in; reset/spawn picks what is on the table
         add_object(spec, name)
 
     vis.add_camera(world)     # the robot's "eyes"
@@ -118,51 +112,167 @@ def _reachable(sim, name, xy):
     return True
 
 
-def sample_layout(sim):
-    """Random start positions: on the table, outside the bin, apart from each other, reachable."""
+def sample_xy(sim, name, others):
+    """A random table spot for `name`: outside the bin, apart from `others` {name: xy}, reachable. None if not found."""
     rng = sim["rng"]
+    radius = pa.OBJECT_SPECS[name]["radius"]
+    for attempt in range(60):
+        xy = np.array([rng.uniform(*pa.SPAWN_X),
+                       pa.TABLE_CENTER_XY[1] + rng.uniform(*pa.SPAWN_DY)])
+        if pa.dist_to_bin(xy) < pa.BIN_RADIUS + radius + pa.MIN_BIN_GAP:
+            continue
+        crowded = False
+        for other, other_xy in others.items():
+            gap = radius + pa.OBJECT_SPECS[other]["radius"] + pa.MIN_OBJ_GAP
+            if np.linalg.norm(xy - other_xy) < gap:
+                crowded = True
+        if crowded:
+            continue
+        if _reachable(sim, name, xy):
+            return xy
+    return None
+
+
+def choose_active(sim):
+    """Pick a random handful of catalog objects (MIN_OBJECTS..MAX_OBJECTS) to put on the table."""
+    names = list(pa.OBJECT_SPECS)
+    high = min(MAX_OBJECTS, len(names))
+    low = min(MIN_OBJECTS, high)
+    count = int(sim["rng"].integers(low, high + 1))
+    picked = sim["rng"].choice(len(names), size=count, replace=False)
+    return [names[i] for i in picked]
+
+
+def sample_layout(sim, names):
+    """Random start positions for `names`. Objects that cannot be placed are left out (and reported)."""
     layout = {}
-    for name in pa.ACTIVE_OBJECTS:
-        radius = pa.OBJECT_SPECS[name]["radius"]
-        chosen = None
-        for attempt in range(60):
-            xy = np.array([rng.uniform(*pa.SPAWN_X),
-                           pa.TABLE_CENTER_XY[1] + rng.uniform(*pa.SPAWN_DY)])
-            if pa.dist_to_bin(xy) < pa.BIN_RADIUS + radius + pa.MIN_BIN_GAP:
-                continue
-            apart = True
-            for other, other_xy in layout.items():
-                gap = radius + pa.OBJECT_SPECS[other]["radius"] + pa.MIN_OBJ_GAP
-                if np.linalg.norm(xy - other_xy) < gap:
-                    apart = False
-            if not apart:
-                continue
-            if _reachable(sim, name, xy):
-                chosen = xy
-                break
-        if chosen is None:
-            print("[World] could not find a reachable random spot for " + name + "; using its default")
-            chosen = np.array(pa.OBJECT_SPECS[name]["xy"], dtype=float)
-        layout[name] = chosen
+    for name in names:
+        xy = sample_xy(sim, name, layout)
+        if xy is None:
+            print("[World] no free reachable spot for " + name + "; leaving it out this round")
+            continue
+        layout[name] = xy
     return layout
 
 
-def reset_objects(sim, randomize=True):
-    """Put every object at a start position (random if randomize) and clear what the robot knows."""
+def random_yaw(sim):
+    return float(sim["rng"].uniform(-np.pi, np.pi)) if RANDOM_YAW else 0.0
+
+
+def place_object(sim, name, xy, yaw=0.0):
+    """Teleport a catalog object to (x, y) on the table, resting, rotated by yaw about z."""
     model, data = sim["model"], sim["data"]
-    if randomize:
-        layout = sample_layout(sim)
-    else:
-        layout = {n: np.array(pa.OBJECT_SPECS[n]["xy"], dtype=float) for n in pa.ACTIVE_OBJECTS}
-    for name in pa.ACTIVE_OBJECTS:
-        joint = model.joint(name + "_joint")
-        xy = layout[name]
-        start = joint.qposadr[0]
-        data.qpos[start:start + 7] = [xy[0], xy[1], pa.object_rest_z(name), 1, 0, 0, 0]
-        start = joint.dofadr[0]
-        data.qvel[start:start + 6] = 0
-    mujoco.mj_forward(model, data)
+    joint = model.joint(name + "_joint")
+    start = joint.qposadr[0]
+    data.qpos[start:start + 7] = [xy[0], xy[1], pa.object_rest_z(name),
+                                  np.cos(yaw / 2.0), 0, 0, np.sin(yaw / 2.0)]
+    start = joint.dofadr[0]
+    data.qvel[start:start + 6] = 0
+
+
+def park_object(sim, name):
+    """Move a catalog object to its spot in the parking area (it is then not part of the scene)."""
+    model, data = sim["model"], sim["data"]
+    joint = model.joint(name + "_joint")
+    start = joint.qposadr[0]
+    data.qpos[start:start + 7] = objs.parking_pos(name) + [1, 0, 0, 0]
+    start = joint.dofadr[0]
+    data.qvel[start:start + 6] = 0
+
+
+def sync_belief(sim):
+    """Make the robot's belief match pa.ACTIVE_OBJECTS: new objects start unseen, removed ones vanish."""
+    old_belief, old_visible = sim["belief"], sim["visible"]
+    names = list(pa.ACTIVE_OBJECTS)
+    sim["belief"] = {n: (old_belief[n] if n in old_belief else vis.NOT_VISIBLE.copy()) for n in names}
+    sim["visible"] = {n: old_visible.get(n, False) for n in names}
     sim["belief_stale"] = True
+
+
+def spawn_object(sim, name, xy=None, yaw=None):
+    """Bring a catalog object onto the table while the sim is running. Returns True on success.
+
+    xy=None picks a random free, reachable spot. Call it only while the sim is idle (the typed
+    `spawn` command does this)."""
+    if name not in pa.OBJECT_SPECS:
+        print("[World] unknown object " + str(name) + ". Catalog: " + ", ".join(pa.OBJECT_SPECS))
+        return False
+    if name in pa.ACTIVE_OBJECTS:
+        print("[World] " + name + " is already on the table")
+        return False
+    if xy is None:
+        truth = pa.read_positions(sim["data"], pa.ACTIVE_OBJECTS)
+        others = {n: p[:2] for n, p in truth.items() if pa.on_table(p)}
+        xy = sample_xy(sim, name, others)
+        if xy is None:
+            print("[World] no free reachable spot for " + name)
+            return False
+    place_object(sim, name, xy, random_yaw(sim) if yaw is None else yaw)
+    pa.ACTIVE_OBJECTS.append(name)
+    mujoco.mj_forward(sim["model"], sim["data"])
+    sync_belief(sim)
+    print("[World] spawned " + name + " at (" + format(xy[0], ".3f") + ", " + format(xy[1], ".3f") + ")")
+    return True
+
+
+def despawn_object(sim, name):
+    """Remove an object from the table (back to the parking area)."""
+    if name not in pa.ACTIVE_OBJECTS:
+        print("[World] " + str(name) + " is not on the table")
+        return False
+    park_object(sim, name)
+    pa.ACTIVE_OBJECTS.remove(name)
+    for arm, held in list(sim["grasped"].items()):
+        if held == name:
+            sim["grasped"].pop(arm)
+    mujoco.mj_forward(sim["model"], sim["data"])
+    sync_belief(sim)
+    print("[World] removed " + name)
+    return True
+
+
+def handle_spawn(sim, text, remove=False):
+    """Typed `spawn mug` / `spawn 3` / `spawn` (one random) and `despawn mug`."""
+    words = [pa.SYNONYMS.get(w, w) for w in text.lower().replace("_", " ").split()]
+    pool = list(pa.OBJECT_SPECS)
+    wanted = pa.match_objects(words, pool)
+    if remove:
+        for name in (wanted or list(pa.ACTIVE_OBJECTS) if "all" in words else wanted):
+            despawn_object(sim, name)
+        return
+    if not wanted:
+        inactive = [n for n in pool if n not in pa.ACTIVE_OBJECTS]
+        count = next((int(w) for w in words if w.isdigit()), 1)
+        order = sim["rng"].permutation(len(inactive))
+        wanted = [inactive[i] for i in order[:count]]
+        if not wanted:
+            print("[World] every catalog object is already on the table")
+    for name in wanted:
+        spawn_object(sim, name)
+
+
+def reset_objects(sim, randomize=True):
+    """Clear the table, then put a random handful of catalog objects on it (and forget what the robot saw)."""
+    for name in pa.OBJECT_SPECS:
+        park_object(sim, name)
+
+    if randomize:
+        pa.ACTIVE_OBJECTS[:] = choose_active(sim)
+        layout = sample_layout(sim, list(pa.ACTIVE_OBJECTS))
+        yaws = {n: random_yaw(sim) for n in layout}
+    else:
+        layout = {n: np.array(xy, dtype=float) for n, xy in objs.DEFAULT_LAYOUT.items()}
+        yaws = {n: 0.0 for n in layout}
+    if len(layout) == 0:                                   # never leave the table empty
+        layout = {n: np.array(xy, dtype=float) for n, xy in objs.DEFAULT_LAYOUT.items()}
+        yaws = {n: 0.0 for n in layout}
+    pa.ACTIVE_OBJECTS[:] = list(layout)
+
+    for name in pa.ACTIVE_OBJECTS:
+        place_object(sim, name, layout[name], yaws[name])
+    mujoco.mj_forward(sim["model"], sim["data"])
+    sim["belief"], sim["visible"] = {}, {}
+    sync_belief(sim)
     sim["grasped"].clear()
     print("[World] objects placed " + ("randomly" if randomize else "at default positions") +
           " (hidden from the robot): " +
@@ -265,6 +375,11 @@ def submit_prompt(sim, text):
         return
     if text.lower() in ["quit", "exit", "q"]:
         sim["quit"] = True
+        return
+    if text.lower().split()[0] in ["spawn", "despawn"]:
+        handle_spawn(sim, text.split(None, 1)[1] if len(text.split()) > 1 else "",
+                     remove=text.lower().startswith("despawn"))
+        show_prompt()
         return
     if sim["vision_on"]:
         vis.start_perception(sim, lambda s: handle_prompt(s, text))
@@ -427,14 +542,14 @@ def make_simulation():
 
 
 def start_agent(bridge, task):
-    bridge.agent_running = True
+    bridge["agent_running"] = True
     print("[Agent] task: " + task)
     threading.Thread(target=ag.run_agent, args=(task, bridge), daemon=True).start()
 
 
 def run_with_viewer():
     model, data, sim = make_simulation()
-    bridge = ag.Bridge()
+    bridge = ag.make_bridge()
     lines = start_input_thread()
     dt = model.opt.timestep
     steps_per_frame = max(1, round(1.0 / 60.0 / dt))  # about 60 screen updates per second
@@ -442,7 +557,8 @@ def run_with_viewer():
     print("ALOHA tidy sim ready (vision: " + (vis.BACKEND if sim["vision_on"] else "off") + ").\n"
           "  Commands: push red block | sweep left | tidy everything | grab blue ball | drop | "
           "return | reset | quit\n"
-          "  Agent:    task <anything>   e.g. 'task put both objects in the bin'")
+          "  Agent:    task <anything>   e.g. 'task put both objects in the bin'\n"
+          "  World:    spawn [name|count] | despawn <name|all>   e.g. 'spawn mug', 'spawn 2'")
     with mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False) as viewer:
         viewer.cam.lookat[:] = [0.0, -0.02, 0.28]
         viewer.cam.distance = 1.3
@@ -454,7 +570,7 @@ def run_with_viewer():
             frame_start = time.perf_counter()
 
             # Take a new command only when the sim and the agent are both free.
-            if sim["mode"] == "idle" and not bridge.agent_running:
+            if sim["mode"] == "idle" and not bridge["agent_running"]:
                 try:
                     text = lines.get_nowait()
                     if text.lower().startswith("task "):
@@ -465,7 +581,7 @@ def run_with_viewer():
                     pass
 
             # Serve requests coming from the agent thread.
-            bridge.pump(sim, submit_agent_skills)
+            ag.pump_bridge(bridge, sim, submit_agent_skills)
 
             for i in range(steps_per_frame):
                 update(sim)

@@ -13,23 +13,14 @@ BIN_RADIUS = 0.07  # an object is "in the bin" if its centre is within this dist
 
 # Random start layout (used by main.reset_objects)
 SPAWN_X = (-0.20, 0.20)    # object x range (m)
-SPAWN_DY = (-0.14, 0.14)   # object y range, relative to the table centre (m)
+SPAWN_DY = (-0.20, 0.20)   # object y range, relative to the table centre (m)
 MIN_BIN_GAP = 0.04         # free space between an object's edge and the bin edge at the start
-MIN_OBJ_GAP = 0.07         # free space between two objects at the start
+MIN_OBJ_GAP = 0.04         # free space between two objects at the start
 HOLD_WIDTH = 0.008         # finger opened this much wider than commanded => something is held
 
-# Objects
-OBJECT_SPECS = {
-    "red_block": {"shape": "box", "half": (0.025, 0.025, 0.025), "rgba": (0.85, 0.10, 0.10, 1),
-                  "mass": 0.08, "xy": (-0.14, 0.03), "radius": 0.025,
-                  "friction": (0.8, 0.005, 0.0001), "damping": 0.3},
-    "blue_ball": {"shape": "sphere", "half": (0.03,), "rgba": (0.15, 0.30, 0.90, 1),
-                  "mass": 0.06, "xy": (0.14, -0.10), "radius": 0.03,
-                  "friction": (0.8, 0.02, 0.02), "damping": 0.6},
-    "green_box": {"shape": "box", "half": (0.035, 0.025, 0.025), "rgba": (0.10, 0.70, 0.25, 1),
-                  "mass": 0.10, "xy": (-0.11, -0.12), "radius": 0.035,
-                  "friction": (0.8, 0.005, 0.0001), "damping": 0.3},
-}
+# Objects: the full catalog lives in objects.py. ACTIVE_OBJECTS is the subset currently on the table;
+# it is changed IN PLACE (ACTIVE_OBJECTS[:] = ...) by main.reset_objects / spawn_object / despawn_object.
+from objects import OBJECT_SPECS
 ACTIVE_OBJECTS = ["red_block", "blue_ball"]
 
 # Planner settings
@@ -52,13 +43,8 @@ SYNONYMS = {"cube": "block", "box": "block", "sphere": "ball"}
 
 
 def object_rest_z(name):
-    """Centre height of an object sitting on the table."""
-    cfg = OBJECT_SPECS[name]
-    if cfg["shape"] == "box":
-        half_z = cfg["half"][2]
-    else:
-        half_z = cfg["half"][0]
-    return TABLE_TOP_Z + half_z + 0.001
+    """Centre height of an object sitting on the table (body origin is at mid-height)."""
+    return TABLE_TOP_Z + OBJECT_SPECS[name]["height"] / 2 + 0.001
 
 
 # Actuator map
