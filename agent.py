@@ -10,11 +10,11 @@ import ollama
 import planner_actuators as pa
 import llm
 
-MODEL = llm.DEFAULT_MODEL      # set OLLAMA_MODEL to something stronger than 3b (e.g. qwen2.5:7b)
+MODEL = llm.DEFAULT_MODEL # set OLLAMA_MODEL to something stronger than 3b (e.g. qwen2.5:7b)
 MAX_STEPS = 15
 
 
-# Observation (always runs on the main/sim thread)
+# Observation
 
 def observe(sim):
     """Compact state the agent sees after every action."""

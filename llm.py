@@ -7,7 +7,7 @@ import ollama
 
 import planner_actuators as pa
 
-DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 MEMORY_PATH = Path(__file__).resolve().parent / "memory_log.jsonl"
 
 
