@@ -1,4 +1,4 @@
-"""Autonomous agent: the LLM picks tools, sees the simulation result, and decides the next step."""
+"""Autonomous agent: the LLM picks tools, sees the result (through the camera), and decides the next step."""
 import io
 import json
 import queue
@@ -9,33 +9,64 @@ import ollama
 
 import planner_actuators as pa
 import llm
+import vision as vis
 
-MODEL = llm.DEFAULT_MODEL # set OLLAMA_MODEL to something stronger than 3b (e.g. qwen2.5:7b)
+MODEL = llm.DEFAULT_MODEL      # set OLLAMA_MODEL to something stronger than 3b (e.g. qwen2.5:7b)
 MAX_STEPS = 15
 
 
-# Observation
+# Observation (always runs on the main/sim thread)
 
 def observe(sim):
-    """Compact state the agent sees after every action."""
+    """What the agent knows: camera-based object positions plus the robot's own gripper sensors."""
     data, amap = sim["data"], sim["amap"]
-    positions = pa.read_positions(data, pa.ACTIVE_OBJECTS)
+    positions = vis.believed_positions(sim)
+    if sim["vision_on"]:
+        visible = sim["visible"]
+    else:
+        visible = {name: True for name in positions}
+    held = pa.held_objects(data, amap, sim["grasped"])         # {side: object}, from finger sensors
+    held_by = {obj: side for side, obj in held.items()}
+
     objects = {}
     for name, p in positions.items():
-        objects[name] = {
-            "xy": [round(float(p[0]), 3), round(float(p[1]), 3)],
-            "on_table": bool(pa.on_table(p)),
-            "in_bin": bool(pa.in_bin(p)),
-            "dist_to_bin": round(pa.dist_to_bin(p), 3),
-            "side": "left" if p[0] < pa.TABLE_CENTER_XY[0] else "right",
-        }
+        seen = bool(visible.get(name, False))
+        entry = {"visible": seen, "held_by": held_by.get(name)}
+        if seen:
+            entry.update({
+                "xy": [round(float(p[0]), 3), round(float(p[1]), 3)],
+                "on_table": bool(pa.on_table(p)),
+                # a carried object is NOT in the bin, even if it is above it
+                "in_bin": bool(pa.in_bin(p)) and name not in held_by,
+                "dist_to_bin": round(pa.dist_to_bin(p), 3),
+                "side": "left" if p[0] < pa.TABLE_CENTER_XY[0] else "right",
+            })
+        else:
+            entry.update({"xy": None, "on_table": False, "in_bin": False})
+            if name not in held_by:
+                entry["note"] = "not visible to the camera (off the table or hidden)"
+        objects[name] = entry
+
     arms = {}
+    attention = []
     for side in pa.SIDES:
         arm = amap[side]
         g = float(data.ctrl[arm["grip_act"]])
         mid = 0.5 * (amap["lo"][arm["grip_act"]] + amap["hi"][arm["grip_act"]])
-        arms[side] = {"gripper": "open" if g > mid else "closed"}
-    return {"objects": objects, "arms": arms, "bin_radius": pa.BIN_RADIUS}
+        arms[side] = {"gripper": "open" if g > mid else "closed", "holding": held.get(side)}
+        if side in held:
+            attention.append(f"{side} arm is still holding {held[side]} in the air. "
+                             f"Call release_gripper(arm='{side}') to drop it, then return_arm_home.")
+        elif side in sim["grasped"] and g <= mid:
+            attention.append(f"{side} arm tried to grab {sim['grasped'][side]} but its gripper closed on "
+                             f"nothing (grasp failed). Call release_gripper and return_arm_home, "
+                             f"then look again and retry or use push_to_bin.")
+    result = {"objects": objects, "arms": arms, "bin_radius": pa.BIN_RADIUS,
+              "perception": "overhead camera, positions are estimates (a centimetre or two of error)"
+                            if sim["vision_on"] else "ground truth"}
+    if attention:
+        result["attention"] = attention
+    return result
 
 
 # Thread bridge
@@ -49,7 +80,10 @@ class Bridge:
         self.agent_running = False
 
     def call(self, kind, skill=None, timeout=300):
-        """Called from the agent thread. Blocks until the main thread has finished the job."""
+        """Called from the agent thread. Blocks until the main thread has finished the job.
+
+        kind: "state" (latest belief, instant), "look" (take a new picture first) or "skill".
+        """
         job = {"kind": kind, "skill": skill, "done": threading.Event(),
                "result": None, "log": []}
         self.q.put(job)
@@ -59,8 +93,11 @@ class Bridge:
 
     def pump(self, sim, submit_skills):
         """Called once per frame from the main loop."""
-        # 1. A running job has finished once the sim is idle again.
+        # 1. A running job is finished once the sim is idle again and the picture is up to date.
         if self.active is not None and sim["mode"] == "idle":
+            if sim["vision_on"] and sim["belief_stale"]:
+                vis.start_perception(sim, lambda s: None)       # look before reporting back
+                return
             job, self.active = self.active, None
             job["result"] = {"planner_log": job["log"], **observe(sim)}
             job["done"].set()
@@ -68,9 +105,13 @@ class Bridge:
         # 2. Start the next queued job.
         if self.active is None and sim["mode"] == "idle" and not self.q.empty():
             job = self.q.get_nowait()
-            if job["kind"] == "scene":
+            if job["kind"] == "state":
                 job["result"] = observe(sim)
                 job["done"].set()
+            elif job["kind"] == "look":
+                if sim["vision_on"]:
+                    vis.start_perception(sim, lambda s: None)
+                self.active = job
             else:
                 buf = io.StringIO()
                 with redirect_stdout(buf):               # capture planner messages
@@ -94,7 +135,9 @@ OBJ = {"type": "string", "enum": list(pa.ACTIVE_OBJECTS)}
 ARM = {"type": "string", "enum": ["left", "right"]}
 
 TOOLS = [
-    _tool("get_scene", "Get current object positions, whether each is in the bin, and gripper states."),
+    _tool("get_scene", "Look at the table with the overhead camera. Returns where each object is "
+          "(estimated from the image, so it may be off by a centimetre or two), whether it is visible, "
+          "in the bin or held, and the state of each gripper."),
     _tool("push_to_bin", "Push an object across the table into the bin. The arm is chosen automatically "
           "if omitted. The arm returns home by itself afterwards.",
           {"object": OBJ, "arm": ARM}, ["object"]),
@@ -104,20 +147,27 @@ TOOLS = [
     _tool("release_gripper", "Open the gripper of an arm (drops whatever it holds).",
           {"arm": ARM}, ["arm"]),
     _tool("return_arm_home", "Move an arm (or both if omitted) back to its home pose.", {"arm": ARM}),
-    _tool("reset_scene", "Reset arms and all objects to their starting positions."),
+    _tool("reset_scene", "Reset arms to home and put the objects in a new random layout."),
     _tool("finish", "Call when the task is complete or impossible.",
           {"success": {"type": "boolean"}, "summary": {"type": "string"}}, ["success", "summary"]),
 ]
 
 SYSTEM = (
     "You control a two-arm ALOHA robot at a table with a circular bin. "
+    "You cannot read object positions directly: they come from an overhead camera. "
     "Achieve the user's task by calling tools, one at a time.\n"
     "Rules:\n"
-    "- Call get_scene first. After each action, read the returned state and verify it worked.\n"
-    "- If an action failed (object not in_bin, planner_log shows an error), try a different "
-    "arm or a different skill (e.g. grab instead of push). Do not repeat the same failing call more than once.\n"
+    "- Call get_scene first. Every action's result also contains a fresh look at the table, so read it "
+    "and verify that the action worked.\n"
+    "- Object positions are estimates. If an object is not visible, it may have fallen off the table or "
+    "be hidden; look again before giving up.\n"
+    "- If an action failed (object not in_bin, planner_log shows an error, an 'attention' message), try a "
+    "different arm or a different skill (e.g. grab instead of push). Do not repeat the same failing call "
+    "more than once.\n"
     "- After grab_object you must release_gripper, then return_arm_home.\n"
-    "- Only claim success if get_scene or the last result confirms it (e.g. in_bin is true).\n"
+    "- An object that is held is NOT in the bin yet. If a result has an 'attention' field or an arm has "
+    "'holding' set, follow it: release_gripper, then return_arm_home.\n"
+    "- Only claim success if the latest result confirms it (in_bin is true and nothing is held).\n"
     "- Call finish as soon as the task is satisfied, or when it cannot be done."
 )
 
@@ -128,13 +178,17 @@ def run_tool(bridge, name, args):
     arm = args.get("arm") if args.get("arm") in pa.SIDES else None
 
     if name == "get_scene":
-        return bridge.call("scene")
+        return bridge.call("look")
 
     if name in ("push_to_bin", "grab_object"):
-        objs = bridge.call("scene")["objects"]
+        objs = bridge.call("state")["objects"]
         obj = args.get("object")
         if obj not in objs:
             return {"error": f"unknown object {obj!r}. Known: {list(objs)}"}
+        if objs[obj].get("held_by"):
+            return {"error": f"{obj} is already held by the {objs[obj]['held_by']} arm"}
+        if not objs[obj]["visible"]:
+            return {"error": f"{obj} is not visible to the camera. Call get_scene to look again."}
         if not objs[obj]["on_table"]:
             return {"error": f"{obj} is not on the table"}
         if objs[obj]["in_bin"]:
@@ -162,6 +216,7 @@ def run_agent(task, bridge, model=MODEL):
                 {"role": "user", "content": task}]
     trace, success, summary = [], False, "Step limit reached."
     seen = {}
+    finish_blocks = 0
     try:
         for _ in range(MAX_STEPS):
             resp = ollama.chat(model=model, messages=messages, tools=TOOLS,
@@ -177,13 +232,21 @@ def run_agent(task, bridge, model=MODEL):
                 name, args = call.function.name, dict(call.function.arguments or {})
                 print(f"[Agent] {name}({args})")
                 if name == "finish":
+                    still = [f"{s} arm is holding {a['holding']}"
+                             for s, a in bridge.call("state")["arms"].items() if a.get("holding")]
+                    if still and finish_blocks < 2:
+                        finish_blocks += 1
+                        messages.append({"role": "tool", "tool_name": name, "content": json.dumps(
+                            {"error": "Cannot finish yet: " + "; ".join(still) +
+                                      ". Call release_gripper first, then return_arm_home."})})
+                        continue
                     success = bool(args.get("success"))
                     summary = args.get("summary", "")
                     done = True
                     break
                 key = (name, json.dumps(args, sort_keys=True))
                 seen[key] = seen.get(key, 0) + 1
-                if seen[key] > 2:
+                if seen[key] > 2 and name != "get_scene":
                     result = {"error": "You already tried this exact call twice. "
                                        "Try something different or finish."}
                 else:

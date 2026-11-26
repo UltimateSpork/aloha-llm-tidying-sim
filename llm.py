@@ -264,3 +264,5 @@ def parse_prompt_ollama(text, positions, model=DEFAULT_MODEL):
     if llm_note:
         notes.insert(0, llm_note)
     return skills, notes
+
+

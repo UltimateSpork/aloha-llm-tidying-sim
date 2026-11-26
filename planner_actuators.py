@@ -11,6 +11,13 @@ GRASP_CLEAR_DZ = 0.02     # small clearance above grasp center on approach
 BIN_CENTER_XY = np.array([0.0, -0.019])
 BIN_RADIUS = 0.07  # an object is "in the bin" if its centre is within this distance
 
+# Random start layout (used by main.reset_objects)
+SPAWN_X = (-0.20, 0.20)    # object x range (m)
+SPAWN_DY = (-0.14, 0.14)   # object y range, relative to the table centre (m)
+MIN_BIN_GAP = 0.04         # free space between an object's edge and the bin edge at the start
+MIN_OBJ_GAP = 0.07         # free space between two objects at the start
+HOLD_WIDTH = 0.008         # finger opened this much wider than commanded => something is held
+
 # Objects
 OBJECT_SPECS = {
     "red_block": {"shape": "box", "half": (0.025, 0.025, 0.025), "rgba": (0.85, 0.10, 0.10, 1),
@@ -82,6 +89,7 @@ def build_actuator_map(model, home_ctrl):
         grip_act = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, side + "/gripper")
         act_ids = np.array(act_ids)
         joint_ids = model.actuator_trnid[act_ids, 0]
+        grip_joint = model.actuator_trnid[grip_act, 0]
 
         # End effector: gripper_link, or wrist_link if that does not exist.
         ee_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, side + "/gripper_link")
@@ -95,6 +103,7 @@ def build_actuator_map(model, home_ctrl):
             "side": side,
             "act_ids": act_ids,
             "grip_act": grip_act,
+            "grip_qpos_adr": int(model.jnt_qposadr[grip_joint]),
             "qpos_adr": model.jnt_qposadr[joint_ids],
             "dof_adr": model.jnt_dofadr[joint_ids],
             # joint limits, also limited by the actuator control range
@@ -132,6 +141,43 @@ def in_bin(pos):
 
 def on_table(pos):
     return pos[2] > TABLE_TOP_Z - 0.03
+
+
+def fingertip(data, arm):
+    """World position of an arm's fingertip, from the robot's own joint state (proprioception)."""
+    rotation = data.xmat[arm["ee_body"]].reshape(3, 3)
+    return data.xpos[arm["ee_body"]] + rotation @ arm["tip_local"]
+
+
+def gripper_holding(data, amap, side):
+    """True if the gripper is commanded closed but the fingers are held apart by something.
+
+    This uses only the robot's own sensors (finger position vs. command), not object positions.
+    """
+    arm = amap[side]
+    cmd = float(data.ctrl[arm["grip_act"]])
+    mid = 0.5 * (amap["lo"][arm["grip_act"]] + amap["hi"][arm["grip_act"]])
+    if cmd >= mid:
+        return False                                    # commanded open
+    return float(data.qpos[arm["grip_qpos_adr"]]) > cmd + HOLD_WIDTH
+
+
+def held_objects(data, amap, grasped):
+    """{side: object name} for every arm that is holding something.
+
+    `grasped` is {side: name} of what each arm last tried to grab; "unknown object" if none.
+    """
+    held = {}
+    for side in SIDES:
+        if gripper_holding(data, amap, side):
+            held[side] = grasped.get(side, "unknown object")
+    return held
+
+
+def arm_displacement(amap, side, ctrl):
+    """How far an arm's joints are from home (larger = the arm that has been moved)."""
+    arm = amap[side]
+    return float(np.max(np.abs(ctrl[arm["act_ids"]] - arm["home_q"])))
 
 
 # Prompt parsing (rule-based fallback)
@@ -610,12 +656,8 @@ def plan_skill(model, scratch, amap, skill, positions, start_ctrl):
     if kind == "drop":
         side = skill.get("arm") or skill.get("side")
         if side not in SIDES:
-            # No arm given: use the arm that is currently holding something (closed gripper).
-            side = "left"
-            for s in SIDES:
-                if gripper_is_closed(amap, amap[s], start_ctrl):
-                    side = s
-                    break
+            # No arm given: use the arm that is furthest from its home pose (the one carrying).
+            side = max(SIDES, key=lambda s: arm_displacement(amap, s, start_ctrl))
         return plan_drop_for_arm(amap, amap[side], start_ctrl), messages
 
     if kind == "return":

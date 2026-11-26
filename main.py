@@ -1,3 +1,4 @@
+import os
 import queue
 import sys
 import threading
@@ -11,9 +12,12 @@ import numpy as np
 import planner_actuators as pa
 import llm as op
 import agent as ag
+import vision as vis
 
 MAX_AUTO_RETRIES = 2
 PROMPT = "> "
+RANDOMIZE = os.environ.get("RANDOMIZE_OBJECTS", "1") != "0"     # random start layout
+SEED = os.environ.get("SIM_SEED")                                # fix it for repeatable layouts
 
 
 # Environment Setup
@@ -34,7 +38,7 @@ def add_object(spec, name):
 
 
 def build_scene():
-    """Build ALOHA + table + bin + objects. Returns (model, data, home_ctrl)."""
+    """Build ALOHA + table + bin + objects + overhead camera. Returns (model, data, home_ctrl)."""
     spec = mm.get("aloha").spec("aloha")  # the robot we are using
 
     # Save the robot's neutral pose, then remove the keyframe
@@ -82,6 +86,8 @@ def build_scene():
     for name in pa.ACTIVE_OBJECTS:
         add_object(spec, name)
 
+    vis.add_camera(world)     # the robot's "eyes"
+
     model = spec.compile()
     data = mujoco.MjData(model)
     return model, data, home_ctrl
@@ -98,16 +104,70 @@ def reset_arms(model, data, amap):
     data.qvel[:] = 0
 
 
-def reset_objects(model, data):
-    """Move every object back to its start position."""
+# World setup: random object layout (this is the simulator's business; the robot never sees it)
+
+def _reachable(sim, name, xy):
+    """Can some arm plan both a push and a grab for an object at xy?"""
+    positions = {name: np.array([xy[0], xy[1], pa.object_rest_z(name)])}
+    for kind in ["push", "grab"]:
+        skill = {"skill": kind, "object": name, "arm": None, "follow": 0.0, "attempt": 0}
+        plan, _ = pa.plan_skill(sim["model"], sim["scratch"], sim["amap"], skill, positions,
+                                sim["amap"]["home"].copy())
+        if plan is None or plan["approximate"]:
+            return False
+    return True
+
+
+def sample_layout(sim):
+    """Random start positions: on the table, outside the bin, apart from each other, reachable."""
+    rng = sim["rng"]
+    layout = {}
+    for name in pa.ACTIVE_OBJECTS:
+        radius = pa.OBJECT_SPECS[name]["radius"]
+        chosen = None
+        for attempt in range(60):
+            xy = np.array([rng.uniform(*pa.SPAWN_X),
+                           pa.TABLE_CENTER_XY[1] + rng.uniform(*pa.SPAWN_DY)])
+            if pa.dist_to_bin(xy) < pa.BIN_RADIUS + radius + pa.MIN_BIN_GAP:
+                continue
+            apart = True
+            for other, other_xy in layout.items():
+                gap = radius + pa.OBJECT_SPECS[other]["radius"] + pa.MIN_OBJ_GAP
+                if np.linalg.norm(xy - other_xy) < gap:
+                    apart = False
+            if not apart:
+                continue
+            if _reachable(sim, name, xy):
+                chosen = xy
+                break
+        if chosen is None:
+            print("[World] could not find a reachable random spot for " + name + "; using its default")
+            chosen = np.array(pa.OBJECT_SPECS[name]["xy"], dtype=float)
+        layout[name] = chosen
+    return layout
+
+
+def reset_objects(sim, randomize=True):
+    """Put every object at a start position (random if randomize) and clear what the robot knows."""
+    model, data = sim["model"], sim["data"]
+    if randomize:
+        layout = sample_layout(sim)
+    else:
+        layout = {n: np.array(pa.OBJECT_SPECS[n]["xy"], dtype=float) for n in pa.ACTIVE_OBJECTS}
     for name in pa.ACTIVE_OBJECTS:
         joint = model.joint(name + "_joint")
-        xy = pa.OBJECT_SPECS[name]["xy"]
+        xy = layout[name]
         start = joint.qposadr[0]
         data.qpos[start:start + 7] = [xy[0], xy[1], pa.object_rest_z(name), 1, 0, 0, 0]
         start = joint.dofadr[0]
         data.qvel[start:start + 6] = 0
     mujoco.mj_forward(model, data)
+    sim["belief_stale"] = True
+    sim["grasped"].clear()
+    print("[World] objects placed " + ("randomly" if randomize else "at default positions") +
+          " (hidden from the robot): " +
+          ", ".join(n + " (" + format(layout[n][0], ".3f") + ", " + format(layout[n][1], ".3f") + ")"
+                    for n in pa.ACTIVE_OBJECTS))
 
 
 # Terminal input (runs in a background thread)
@@ -131,12 +191,25 @@ def show_prompt():
 # Running skills
 def make_sim(model, data, amap):
     """All the changing state of the program, in one dictionary."""
+    cam_info = None
+    renderer = None
+    vision_on = False
+    if vis.BACKEND != "off":
+        try:
+            cam_info = vis.make_camera_info(model)
+            renderer = vis.make_renderer(model)
+            vision_on = True
+        except Exception as exc:
+            print("[Vision] disabled, cannot initialize camera/renderer (" + str(exc) + "). "
+                  "Using ground-truth positions.")
+    names = list(pa.ACTIVE_OBJECTS)
     return {
         "model": model,
         "data": data,
         "amap": amap,
         "scratch": mujoco.MjData(model),   # separate data object used by the IK solver
-        "mode": "idle",                    # "idle", "moving" or "settling"
+        "rng": np.random.default_rng(int(SEED) if SEED is not None else None),
+        "mode": "idle",                    # "idle", "moving", "settling" or "perceiving"
         "skills": [],                      # skills waiting to run
         "targets": [],                     # objects we will check at the end
         "retries": 0,
@@ -147,14 +220,26 @@ def make_sim(model, data, amap):
         "reset_when_done": False,
         "settle_left": 0.0,
         "quit": False,
+        # perception (procedural state)
+        "cam_info": cam_info,
+        "renderer": renderer,
+        "vision_on": vision_on,
+        "belief": {n: vis.NOT_VISIBLE.copy() for n in names},   # where the robot thinks objects are
+        "visible": {n: False for n in names},
+        "belief_stale": True,              # True after anything moved: the picture is out of date
+        "perception_done": None,
+        "perception_result": None,
+        "after_perception": None,
+        "last_image": None,
+        "grasped": {},                     # {arm: object} what each arm last tried to pick up
     }
 
 
 def submit_skills(sim, skills, check_targets=True):
     """Queue a list of skill dicts and start running them.
 
-    check_targets=True  -> after the skills finish, verify pushed objects are in the bin and
-                           automatically re-push (the classic behaviour).
+    check_targets=True  -> after the skills finish, look again and verify pushed objects are in the
+                           bin, automatically re-pushing (the classic behaviour).
     check_targets=False -> no automatic check (used by the agent, which verifies by itself).
     """
     sim["skills"] = list(skills)
@@ -173,7 +258,7 @@ def submit_agent_skills(sim, skills):
 
 
 def submit_prompt(sim, text):
-    """Parse a typed prompt (via Ollama first, with rule-based fallback) and start running it."""
+    """Typed command: look at the table first, then parse (Ollama, else rules) and run it."""
     text = text.strip()
     if text == "":
         show_prompt()
@@ -181,8 +266,14 @@ def submit_prompt(sim, text):
     if text.lower() in ["quit", "exit", "q"]:
         sim["quit"] = True
         return
+    if sim["vision_on"]:
+        vis.start_perception(sim, lambda s: handle_prompt(s, text))
+    else:
+        handle_prompt(sim, text)
 
-    positions = pa.read_positions(sim["data"], pa.ACTIVE_OBJECTS)
+
+def handle_prompt(sim, text):
+    positions = vis.believed_positions(sim)
     ollama_out = op.parse_prompt_ollama(text, positions)
     if ollama_out is not None:
         skills, notes = ollama_out
@@ -202,8 +293,13 @@ def submit_prompt(sim, text):
 def start_next_skill(sim):
     """Plan the next skill in the queue and start playing it. If none are left, start settling."""
     while len(sim["skills"]) > 0:
-        skill = sim["skills"].pop(0)
-        positions = pa.read_positions(sim["data"], pa.ACTIVE_OBJECTS)
+        skill = sim["skills"][0]
+        # Skills that need object positions get a fresh look first if anything moved since the last one.
+        if sim["vision_on"] and sim["belief_stale"] and skill["skill"] in ["push", "grab", "sweep"]:
+            vis.start_perception(sim, start_next_skill)
+            return
+        sim["skills"].pop(0)
+        positions = vis.believed_positions(sim)
         plan, messages = pa.plan_skill(sim["model"], sim["scratch"], sim["amap"], skill, positions,
                                        sim["data"].ctrl.copy())
         for message in messages:
@@ -211,6 +307,12 @@ def start_next_skill(sim):
         if plan is None:
             continue
         print("[Exec] " + plan["description"])
+        if skill["skill"] == "grab":
+            sim["grasped"][plan["arm"]] = skill["object"]
+        elif skill["skill"] == "drop":
+            sim["grasped"].pop(plan["arm"], None)
+        elif skill["skill"] == "reset":
+            sim["grasped"].clear()
         sim["keyframes"] = list(plan["keyframes"])
         sim["current"] = sim["keyframes"].pop(0)
         sim["start_ctrl"] = sim["data"].ctrl.copy()
@@ -250,22 +352,27 @@ def step_motion(sim):
             sim["current"] = sim["keyframes"].pop(0)
         else:
             sim["current"] = None
+            sim["belief_stale"] = True      # something moved: what we last saw is out of date
             if sim["reset_when_done"]:
-                reset_objects(sim["model"], sim["data"])
+                reset_objects(sim, RANDOMIZE)
                 sim["reset_when_done"] = False
                 sim["targets"] = []
             start_next_skill(sim)
 
 
-def check_and_replan(sim):
-    """Check whether the target objects are in the bin; if not, plan again (up to MAX_AUTO_RETRIES)."""
-    positions = pa.read_positions(sim["data"], pa.ACTIVE_OBJECTS)
+def check_and_replan(sim, fresh=False):
+    """Look at the table; if target objects are not in the bin, plan again (up to MAX_AUTO_RETRIES)."""
+    if sim["vision_on"] and len(sim["targets"]) > 0 and not fresh:
+        vis.start_perception(sim, lambda s: check_and_replan(s, fresh=True))
+        return
+
+    positions = vis.believed_positions(sim)
     lines = []
     missing = []
     for name in sim["targets"]:
         distance = pa.dist_to_bin(positions[name])
         if not pa.on_table(positions[name]):
-            lines.append(name + ": OFF TABLE")
+            lines.append(name + ": NOT SEEN" if sim["vision_on"] else name + ": OFF TABLE")
         elif distance <= pa.BIN_RADIUS:
             lines.append(name + ": IN BIN (" + format(distance, ".3f") + " m)")
         else:
@@ -303,6 +410,9 @@ def update(sim):
         sim["settle_left"] = sim["settle_left"] - sim["model"].opt.timestep
         if sim["settle_left"] <= 0:
             check_and_replan(sim)
+    elif sim["mode"] == "perceiving":
+        if sim["perception_done"] is not None and sim["perception_done"].is_set():
+            vis.finish_perception(sim)
 
 
 # Main program
@@ -311,8 +421,9 @@ def make_simulation():
     model, data, home_ctrl = build_scene()
     amap = pa.build_actuator_map(model, home_ctrl)
     reset_arms(model, data, amap)
-    reset_objects(model, data)
-    return model, data, make_sim(model, data, amap)
+    sim = make_sim(model, data, amap)
+    reset_objects(sim, RANDOMIZE)
+    return model, data, sim
 
 
 def start_agent(bridge, task):
@@ -328,7 +439,7 @@ def run_with_viewer():
     dt = model.opt.timestep
     steps_per_frame = max(1, round(1.0 / 60.0 / dt))  # about 60 screen updates per second
 
-    print("ALOHA tidy sim ready.\n"
+    print("ALOHA tidy sim ready (vision: " + (vis.BACKEND if sim["vision_on"] else "off") + ").\n"
           "  Commands: push red block | sweep left | tidy everything | grab blue ball | drop | "
           "return | reset | quit\n"
           "  Agent:    task <anything>   e.g. 'task put both objects in the bin'")
@@ -374,11 +485,15 @@ def run_headless(commands):
         submit_prompt(sim, command)
         start_time = data.time
         while sim["mode"] != "idle" and data.time - start_time < 120:
+            if sim["mode"] == "perceiving":      # wait for the vision model without burning sim time
+                time.sleep(0.005)
+                update(sim)
+                continue
             update(sim)
             mujoco.mj_step(model, data)
-        positions = pa.read_positions(data, pa.ACTIVE_OBJECTS)
-        for name in positions:
-            print("   " + name + " at " + str(np.round(positions[name], 3)))
+        truth = pa.read_positions(data, pa.ACTIVE_OBJECTS)
+        for name in truth:
+            print("   " + name + " (true position) at " + str(np.round(truth[name], 3)))
 
 
 if __name__ == "__main__":
